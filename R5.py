@@ -74,48 +74,82 @@ torch.set_printoptions(precision=3, sci_mode=False)
 '''
 ----------Network----------
 '''
+
+
 class SNN(torch.nn.Module):
     def __init__(self):
         super(SNN, self).__init__()
         # Parameters
         neuron_params = {
             'threshold': 1.25,
-            'current_decay': 0.25,
+            'current_decay': 0.25,  # 0.25
             'voltage_decay': 0.03,
             'tau_grad': 0.03,
             'scale_grad': 3,
             'requires_grad': True,
         }
-        neuron_params_drop = {**neuron_params, 'dropout': slayer.neuron.Dropout(p=0.05),}
+        neuron_params_drop = {**neuron_params, 'dropout': slayer.neuron.Dropout(p=0.05), }
         blocks = []
         for dim_index in range(len(MODEL_SIZE) - 2):
             blocks.append(slayer.block.cuba.Dense(neuron_params_drop, MODEL_SIZE[dim_index], MODEL_SIZE[dim_index + 1]))
         blocks.append(slayer.block.cuba.Dense(neuron_params, MODEL_SIZE[-2], MODEL_SIZE[-1]))
         self.blocks = torch.nn.ModuleList(blocks)
 
+    def r_stdp(self, pre_spikes, post_spikes, reward, learning_rate=1e-3, A_plus=0.1, A_minus=0.1, tau_plus=20.0,
+               tau_minus=20.0):
+        print("working")
+        """
+        Apply Reward-modulated Spike-Timing-Dependent Plasticity (R-STDP) to update weights.
+        Args:
+            pre_spikes: Tensor of pre-synaptic spike times for each layer.
+            post_spikes: Tensor of post-synaptic spike times for each layer.
+            reward: Reward signal (positive for reinforcement, negative for punishment).
+            learning_rate: Learning rate for the weight updates.
+            A_plus: Maximum potentiation amplitude.
+            A_minus: Maximum depression amplitude.
+            tau_plus: Time constant for potentiation.
+            tau_minus: Time constant for depression.
+        """
+        for block, pre_times, post_times in zip(self.blocks, pre_spikes, post_spikes):
+            if hasattr(block, 'weights'):
+                weights = block.weights.data  # Access weight tensor
+                delta_t = post_times.unsqueeze(0) - pre_times.unsqueeze(1)  # Spike timing differences
+
+                # Compute STDP updates
+                stdp_update = torch.zeros_like(delta_t)
+                potentiation_mask = delta_t > 0
+                depression_mask = delta_t < 0
+
+                stdp_update[potentiation_mask] = A_plus * torch.exp(-delta_t[potentiation_mask] / tau_plus)
+                stdp_update[depression_mask] = -A_minus * torch.exp(delta_t[depression_mask] / tau_minus)
+
+                # Compute R-STDP weight updates
+                delta_w = reward * learning_rate * stdp_update
+
+                # Update weights
+                weights += delta_w
+                weights.clamp_(0, 1)  # Ensure weights stay within valid bounds (e.g., 0 to 1)
+
+                # Save the updated weights back to the block
+                block.weights.data = weights
+
     def forward(self, spike):
-        count = [torch.sum((spike[..., 1:]) > 0).to(torch.int64)]  # Initialize the running counter & count the initial spikes
-        pre_spike_times = []
-        post_spike_times = []
+        pre_spikes = []  # To store pre-synaptic spike times for each layer
+        post_spikes = []  # To store post-synaptic spike times for each layer
+
+        count = [torch.sum((spike[..., 1:]) > 0).to(torch.int64)]  # Initialize spike count
         for block in self.blocks:
-            spike = block(spike)
+            pre_spikes.append(spike)  # Record pre-synaptic spikes for the current layer
+            spike = block(spike)  # Forward propagation through the layer
+            post_spikes.append(spike)  # Record post-synaptic spikes for the current layer
+
             if PROFILING:
-                count.append(torch.sum((spike[..., 1:]) > 0).to(torch.int64))  # Count all the spikes in this layer & append it to the running count
-            pre_spike_times.append(spike)
+                count.append(torch.sum((spike[..., 1:]) > 0).to(torch.int64))
 
-        post_spike_times = pre_spike_times[1:] + [spike]
         if PROFILING:
-            return spike, torch.LongTensor(count).to(spike.device), pre_spike_times, post_spike_times
+            return spike, torch.LongTensor(count).to(spike.device), pre_spikes, post_spikes
         else:
-            return spike,0
-
-    import torch
-
-
-
-    def apply_r_stdp(self, pre_spike_times, post_spike_times, reward):
-        for i, block in enumerate(self.blocks):
-            block.synapse.weight = self.r_stdp(block.synapse.weight, pre_spike_times[i], post_spike_times[i], reward)
+            return spike, 0, pre_spikes, post_spikes
 
     def save(self, location):
         torch.save(self.state_dict(), location)
@@ -139,6 +173,7 @@ class SNN(torch.nn.Module):
         layer = h.create_group("layer")
         for i, b in enumerate(self.blocks):
             b.export_hdf5(layer.create_group(f"{i}"))
+
 
 
 
@@ -664,18 +699,7 @@ def train_model():
             print("\r" + " " * CLS_AMOUNT + "\r", end="")
             print(f"Set: Training\tSample: {i + 1}/{len(train_loader)}")
             # Forward Pass
-            output, count, pre_spike_times, post_spike_times = model(input.to(device))
-
-            for sample, ground_truth in zip(output, target):
-                output_counts = []
-                counter = 0
-                for label in sample:
-                    output_counts.append(
-                        {"label": counter, "count": torch.sum((label > 0).to(torch.int64)).cpu().item()})
-                    counter += 1
-                output_counts = sorted(output_counts, key=lambda x: x["count"], reverse=True)
-                ranking = [i for i, _ in enumerate(output_counts) if _["label"] == ground_truth][0] + 1
-                reward=2*ranking-1
+            output, count, pre_spikes, post_spikes = model(input.to(device))
             # Compute Loss
             loss = error(output, target.to(device))
             # Zero out the gradients
@@ -685,15 +709,17 @@ def train_model():
             loss = loss.cpu()
             # Take an optimizer step
             optimizer.step()
-            # Apply R-STDP
-
-            model.apply_r_stdp(pre_spike_times, post_spike_times, reward)
             # Record the loss
             running_loss += loss.item()
             print(f"Loss: {loss:.3f}\tAverage: {running_loss / (i + 1):.3f}")
             # Add the operation counts to the running total
             if PROFILING:
                 counts = torch.add(counts, count)
+
+            # Apply R-STDP
+            reward = 1.0 if loss.item() < running_loss / (i + 1) else -1.0  # Example reward signal based on loss improvement
+            model.r_stdp(pre_spikes, post_spikes, reward)
+
         # Append the running loss to the stat block
         stats.append(running_loss)
         # Update the counts
@@ -709,8 +735,8 @@ def train_model():
         running_loss = 0
         running_accuracy = 0
         running_sum_rank = 0
-        # Run the vaidation set
-        if (VALIDATION_SET):
+        # Run the validation set
+        if VALIDATION_SET:
             for i, (input, target) in enumerate(valid_loader):
                 # Move the print head up 4 rows
                 print("\x1b[1A\x1b[1A\x1b[1A\x1b[1A", end="")
@@ -718,7 +744,7 @@ def train_model():
                 print("\r" + " " * CLS_AMOUNT + "\r", end="")
                 print(f"Set: Validation\tSample: {i + 1}/{len(valid_loader)}")
                 # Forward Pass
-                output, _, pre_spike_times, post_spike_times = model(input.to(device))
+                output, count, pre_spikes, post_spikes = model(input.to(device))
                 # Compute Loss
                 loss = error(output, target.to(device)).cpu()
                 # Record the loss
@@ -738,7 +764,7 @@ def train_model():
                         ranking = [i for i, _ in enumerate(output_counts) if _["label"] == ground_truth][0] + 1
                         sum_rank += 1 / ranking
                         accuracy_rec.append(1 if ranking == 1 else 0)
-                        if (BATCH_SIZE == 1):
+                        if BATCH_SIZE == 1:
                             print(f"Target: {target}\tAccuracy: {accuracy_rec}\tRank: {ranking}")
                             print(f"Counts: {output_counts}")
                 else:  # NETWORK_TYPE == "ANN":
@@ -747,7 +773,7 @@ def train_model():
                     accuracy_rec = torch.eq(sorted_indices[:, 0], target).int().tolist()
                     rankings = torch.where(torch.eq(sorted_indices, target.view(-1, 1)))[1] + 1
                     sum_rank += torch.sum(1 / rankings).item()
-                    if (BATCH_SIZE == 1):
+                    if BATCH_SIZE == 1:
                         print(f"Target: {target[0].item()}\tAccuracy: {accuracy_rec}\tRank: {rankings[0].item()}")
                         print(f"Probabilities: {[f'{prob:.3f}' for prob in output_prob[0].tolist()]}")
                 accuracy = sum(accuracy_rec) / len(accuracy_rec)
@@ -756,7 +782,7 @@ def train_model():
                 # Record Accuracy & MRR
                 print(f"Acc: {accuracy:.3f}\tTotal: {running_accuracy / ((i + 1) * BATCH_SIZE):.3f}")
                 print(f"MRR: {sum_rank / BATCH_SIZE:.3f}\tTotal:{running_sum_rank / ((i + 1) * BATCH_SIZE):.3f}")
-                if (BATCH_SIZE == 1):
+                if BATCH_SIZE == 1:
                     print("\x1b[1A\x1b[1A", end="")
             # Add the running loss, accuracy, & MRR to the stat block
             stats.append(running_loss)
